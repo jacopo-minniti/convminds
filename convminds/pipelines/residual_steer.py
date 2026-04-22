@@ -40,7 +40,6 @@ class ResidualSteerPipeline(BasePipeline):
         phase_epochs: list[int], 
         eval_loader: DataLoader | None = None,
         eval_interval: int = 1,
-        multi_token: bool = False,
         log_interval: int = 50
     ) -> dict[str, float]:
         """
@@ -151,40 +150,27 @@ class ResidualSteerPipeline(BasePipeline):
                 for batch in pbar:
                     B = batch["bold"].to(self.device)
                     
-                    # Construction of steers for either single-token or multi-token phrase loss
+                    # Construction of steers for multi-token phrase loss
                     context_raw = batch["context"]
                     target_raw = batch["target"]
                     
-                    if not multi_token:
-                        # Single-token align (legacy/default mode)
-                        ctx_enc = self.model.tokenizer(context_raw, return_tensors="pt", padding=True, truncation=True)
-                        input_ids, attention_mask = ctx_enc.input_ids.to(self.device), ctx_enc.attention_mask.to(self.device)
-                        
-                        target_tokens = [self.model.tokenizer.encode(" " + t)[0] if len(t) > 0 else self.model.tokenizer.eos_token_id for t in batch["target"]]
-                        target_label = torch.tensor(target_tokens, device=self.device)
-                        
-                        logits, _ = self.model.forward_steered(input_ids, B, num_steer_tokens=1, attention_mask=attention_mask)
-                        next_token_logits = logits[:, -1, :]
-                        loss = criterion(next_token_logits, target_label)
-                    else:
-                        # Full Phrase align (Sequence mode)
-                        ctx_enc = self.model.tokenizer(context_raw, return_tensors="pt", padding=True, truncation=True)
-                        tgt_enc = self.model.tokenizer(target_raw, return_tensors="pt", padding=True, truncation=True)
-                        
-                        ctx_ids, ctx_mask = ctx_enc.input_ids.to(self.device), ctx_enc.attention_mask.to(self.device)
-                        tgt_ids, tgt_mask = tgt_enc.input_ids.to(self.device), tgt_enc.attention_mask.to(self.device)
-                        
-                        full_ids = torch.cat([ctx_ids, tgt_ids], dim=1)
-                        full_mask = torch.cat([ctx_mask, tgt_mask], dim=1)
-                        num_steer = tgt_ids.shape[1] + 1
-                        
-                        logits, _ = self.model.forward_steered(full_ids, B, num_steer_tokens=num_steer, attention_mask=full_mask)
-                        
-                        start_idx = ctx_ids.shape[1] - 1
-                        end_idx = full_ids.shape[1] - 1
-                        logits_at_target_positions = logits[:, start_idx:end_idx, :].reshape(-1, logits.size(-1))
-                        target_labels = full_ids[:, start_idx+1:].reshape(-1)
-                        loss = criterion(logits_at_target_positions, target_labels)
+                    ctx_enc = self.model.tokenizer(context_raw, return_tensors="pt", padding=True, truncation=True)
+                    tgt_enc = self.model.tokenizer(target_raw, return_tensors="pt", padding=True, truncation=True)
+                    
+                    ctx_ids, ctx_mask = ctx_enc.input_ids.to(self.device), ctx_enc.attention_mask.to(self.device)
+                    tgt_ids, tgt_mask = tgt_enc.input_ids.to(self.device), tgt_enc.attention_mask.to(self.device)
+                    
+                    full_ids = torch.cat([ctx_ids, tgt_ids], dim=1)
+                    full_mask = torch.cat([ctx_mask, tgt_mask], dim=1)
+                    num_steer = tgt_ids.shape[1] + 1
+                    
+                    logits, _ = self.model.forward_steered(full_ids, B, num_steer_tokens=num_steer, attention_mask=full_mask)
+                    
+                    start_idx = ctx_ids.shape[1] - 1
+                    end_idx = full_ids.shape[1] - 1
+                    logits_at_target_positions = logits[:, start_idx:end_idx, :].reshape(-1, logits.size(-1))
+                    target_labels = full_ids[:, start_idx+1:].reshape(-1)
+                    loss = criterion(logits_at_target_positions, target_labels)
                     
                     self.optimizer.zero_grad()
                     loss.backward()
@@ -207,33 +193,23 @@ class ResidualSteerPipeline(BasePipeline):
                             context_raw = batch["context"]
                             target_raw = batch["target"]
                             
-                            if not multi_token:
-                                ctx_enc = self.model.tokenizer(context_raw, return_tensors="pt", padding=True, truncation=True)
-                                input_ids, attention_mask = ctx_enc.input_ids.to(self.device), ctx_enc.attention_mask.to(self.device)
-                                target_tokens = [self.model.tokenizer.encode(" " + t)[0] if len(t) > 0 else self.model.tokenizer.eos_token_id for t in target_raw]
-                                target_label = torch.tensor(target_tokens, device=self.device)
-                                
-                                logits, _ = self.model.forward_steered(input_ids, B, num_steer_tokens=1, attention_mask=attention_mask)
-                                next_token_logits = logits[:, -1, :]
-                                val_losses.append(criterion(next_token_logits, target_label).item())
-                            else:
-                                # Multi-token validation
-                                ctx_enc = self.model.tokenizer(context_raw, return_tensors="pt", padding=True, truncation=True)
-                                tgt_enc = self.model.tokenizer(target_raw, return_tensors="pt", padding=True, truncation=True)
-                                ctx_ids, ctx_mask = ctx_enc.input_ids.to(self.device), ctx_enc.attention_mask.to(self.device)
-                                tgt_ids, tgt_mask = tgt_enc.input_ids.to(self.device), tgt_enc.attention_mask.to(self.device)
-                                
-                                full_ids = torch.cat([ctx_ids, tgt_ids], dim=1)
-                                full_mask = torch.cat([ctx_mask, tgt_mask], dim=1)
-                                num_steer = tgt_ids.shape[1] + 1
-                                
-                                logits, _ = self.model.forward_steered(full_ids, B, num_steer_tokens=num_steer, attention_mask=full_mask)
-                                
-                                start_idx = ctx_ids.shape[1] - 1
-                                end_idx = full_ids.shape[1] - 1
-                                logits_at_target_positions = logits[:, start_idx:end_idx, :].reshape(-1, logits.size(-1))
-                                target_labels = full_ids[:, start_idx+1:].reshape(-1)
-                                val_losses.append(criterion(logits_at_target_positions, target_labels).item())
+                            # Multi-token validation
+                            ctx_enc = self.model.tokenizer(context_raw, return_tensors="pt", padding=True, truncation=True)
+                            tgt_enc = self.model.tokenizer(target_raw, return_tensors="pt", padding=True, truncation=True)
+                            ctx_ids, ctx_mask = ctx_enc.input_ids.to(self.device), ctx_enc.attention_mask.to(self.device)
+                            tgt_ids, tgt_mask = tgt_enc.input_ids.to(self.device), tgt_enc.attention_mask.to(self.device)
+                            
+                            full_ids = torch.cat([ctx_ids, tgt_ids], dim=1)
+                            full_mask = torch.cat([ctx_mask, tgt_mask], dim=1)
+                            num_steer = tgt_ids.shape[1] + 1
+                            
+                            logits, _ = self.model.forward_steered(full_ids, B, num_steer_tokens=num_steer, attention_mask=full_mask)
+                            
+                            start_idx = ctx_ids.shape[1] - 1
+                            end_idx = full_ids.shape[1] - 1
+                            logits_at_target_positions = logits[:, start_idx:end_idx, :].reshape(-1, logits.size(-1))
+                            target_labels = full_ids[:, start_idx+1:].reshape(-1)
+                            val_losses.append(criterion(logits_at_target_positions, target_labels).item())
                     
                     val_avg = np.mean(val_losses)
                     log_str += f" | Val CE: {val_avg:.6f}"
@@ -248,7 +224,7 @@ class ResidualSteerPipeline(BasePipeline):
         self, 
         test_loader: DataLoader, 
         samples_to_show: int = 2, 
-        max_new_tokens: int = 5
+        max_new_tokens: int = 15
     ) -> dict[str, float]:
         """
         Multi-baseline benchmark comparison using both token-level accuracy 

@@ -25,7 +25,6 @@ def main():
     parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate for the adapter")
     parser.add_argument("--dropout", type=float, default=0.1, help="Dropout rate for the adapter")
     parser.add_argument("--weight-decay", type=float, default=0.01, help="L2 regularization (weight decay) for AdamW")
-    parser.add_argument("--multi-token", action="store_true", help="Use multi-token CE loss in Phase 2")
     parser.add_argument("--batch-size", type=int, default=32, help="Batch size for training")
     parser.add_argument("--subject", type=str, default="S1", help="Subject ID (e.g., S1, S2)")
     parser.add_argument("--llm", type=str, default="gpt2", help="Base LLM ID from HuggingFace")
@@ -59,8 +58,7 @@ def main():
             train_loader, 
             phase_epochs=phase_epochs, 
             eval_loader=test_loader, 
-            eval_interval=args.eval_interval,
-            multi_token=args.multi_token
+            eval_interval=args.eval_interval
         )
     
     # Evaluation

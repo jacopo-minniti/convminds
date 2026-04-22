@@ -104,9 +104,9 @@ class HuthAlignmentDataset(Dataset):
         return {
             "bold": torch.from_numpy(bold_window).float(),
             "context": get_words(x-3, x-1),
-            "target": get_words(x, x),
+            "target": get_words(x, x+1),
             "subject": subj,
             "story": story,
             "tr": x,
-            "time_window": (tr_times[x], tr_times[x+1] if x+1 < len(tr_times) else tr_times[x]+2.0)
+            "time_window": (tr_times[x], tr_times[x+2] if x+2 < len(tr_times) else tr_times[x]+4.0)
         }
