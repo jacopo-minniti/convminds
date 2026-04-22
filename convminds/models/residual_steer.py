@@ -118,16 +118,16 @@ class ResidualSteerLM(BrainLanguageModel):
                 is_tuple = isinstance(output, tuple)
                 hidden_states = output[0] if is_tuple else output
                 
-                # Capture H_query from the start of the steering window 
-                # (usually the last true context token)
+                # Dynamic Multi-Token Steering: 
+                # Query the brain adapter using the hidden states of ALL tokens 
+                # in the steering window independently.
                 context_pos = -num_steer_tokens
-                # Use a slice that handles the end of sequence correctly
-                H_query = hidden_states[:, context_pos : (context_pos + 1) if (context_pos + 1) < 0 else None, :]
+                H_query = hidden_states[:, context_pos:, :]
                 
                 v_steer = self.adapters[layer_str](brain_batch, H_query)
                 v_steer_cache[layer_str] = v_steer
                 
-                # Apply steer to the entire N trailing positions (teacher forcing seq)
+                # Apply dynamic steer to each position
                 front_ids = hidden_states[:, :context_pos, :]
                 steered_chunk = hidden_states[:, context_pos:, :] + v_steer
                 
@@ -157,24 +157,22 @@ class ResidualSteerLM(BrainLanguageModel):
         max_new_tokens: int = 15,
         **kwargs
     ) -> torch.Tensor:
-        with torch.no_grad():
-            outputs = self.llm(input_ids=input_ids, output_hidden_states=True, **kwargs)
-            
-            v_steers = {}
-            for layer in self.injection_layers:
-                H_query = outputs.hidden_states[layer][:, -1:, :]
-                v_steers[str(layer)] = self.adapters[str(layer)](brain_batch, H_query)
 
         def get_persistent_hook(layer_str):
             def persistent_steering_hook(module, inputs, output):
                 is_tuple = isinstance(output, tuple)
                 hidden_states = output[0] if is_tuple else output
-                v_steer = v_steers[layer_str]
                 
-                # During generation, we always steer the full available length 
-                # (which is just the new token being predicted)
+                # Dynamic Autoregressive Steering:
+                # Calculate v_steer on-the-fly using the newest token's hidden state
+                H_query_current = hidden_states[:, -1:, :]
+                v_steer_dynamic = self.adapters[layer_str](brain_batch, H_query_current)
+                
+                # During generation, we always steer the last token
+                # (which is the new token being predicted)
                 front_context = hidden_states[:, :-1, :]
-                last_token_steered = hidden_states[:, -1:, :] + v_steer
+                last_token_steered = hidden_states[:, -1:, :] + v_steer_dynamic
+                
                 steered_hidden_states = torch.cat([front_context, last_token_steered], dim=1)
                 
                 if is_tuple:
