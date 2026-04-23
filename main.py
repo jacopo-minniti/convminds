@@ -22,7 +22,8 @@ def main():
     parser = argparse.ArgumentParser(description="Convergent Minds: Phase-based Brain Steering")
     parser.add_argument("--epochs", type=str, default="5,10", help="Comma-separated epochs for Ph1 and Ph2")
     parser.add_argument("--eval-interval", type=int, default=1, help="Epoch interval for validation logging")
-    parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate for the adapter")
+    parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate for Phase 1")
+    parser.add_argument("--lr-phase2", type=float, default=None, help="Learning rate for Phase 2 (default: lr/3)")
     parser.add_argument("--dropout", type=float, default=0.1, help="Dropout rate for the adapter")
     parser.add_argument("--weight-decay", type=float, default=0.01, help="L2 regularization (weight decay) for AdamW")
     parser.add_argument("--batch-size", type=int, default=32, help="Batch size for training")
@@ -50,7 +51,7 @@ def main():
     model = ResidualSteerLM(llm_id=args.llm, injection_layers=injection_layers, dropout=args.dropout)
     
     # 3. Pipeline Execution
-    pipeline = ResidualSteerPipeline(model=model, lr=args.lr, weight_decay=args.weight_decay, device=device)
+    pipeline = ResidualSteerPipeline(model=model, lr=args.lr, lr_phase2=args.lr_phase2, weight_decay=args.weight_decay, device=device)
     
     # Training
     if any(e > 0 for e in phase_epochs):

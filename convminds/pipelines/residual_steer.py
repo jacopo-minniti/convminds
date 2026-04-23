@@ -39,11 +39,15 @@ class ResidualSteerPipeline(BasePipeline):
         self,
         model: ResidualSteerLM,
         lr: float = 1e-4,
+        lr_phase2: float | None = None,
         weight_decay: float = 0.01,
         device: torch.device | None = None,
     ):
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model = model.to(self.device)
+        self.lr = lr
+        self.lr_phase2 = lr_phase2 if lr_phase2 is not None else lr / 3
+        self.weight_decay = weight_decay
         self.optimizer = AdamW(self.model.adapters.parameters(), lr=lr, weight_decay=weight_decay)
 
     # ------------------------------------------------------------------
@@ -150,6 +154,7 @@ class ResidualSteerPipeline(BasePipeline):
         # --- PHASE 2: CE Injection ---
         if len(phase_epochs) > 1 and phase_epochs[1] > 0:
             logger.info(f"Starting Phase 2: CE Injection ({phase_epochs[1]} epochs)")
+            self.optimizer = AdamW(self.model.adapters.parameters(), lr=self.lr_phase2, weight_decay=self.weight_decay)
             criterion = nn.CrossEntropyLoss()
 
             for epoch in range(1, phase_epochs[1] + 1):
