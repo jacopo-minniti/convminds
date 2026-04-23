@@ -80,7 +80,7 @@ def main():
         layers_str = args.layers.replace(",", "-")
         save_name = f"steer_{args.llm}_{args.subject}_L{layers_str}_ep{epochs_str}.pt"
         save_path = model_dir / save_name
-        torch.save(accelerator.unwrap_model(pipeline.model).adapters.state_dict(), save_path)
+        torch.save(pipeline.unwrapped.adapters.state_dict(), save_path)
         logger.info(f"Steering Adapter weights saved to {save_path}")
 
 if __name__ == "__main__":

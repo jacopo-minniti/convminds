@@ -54,10 +54,10 @@ class ResidualSteerPipeline(BasePipeline):
 
         self.model = model.to(self.device)
         self.optimizer = AdamW(self.model.adapters.parameters(), lr=lr, weight_decay=weight_decay)
-        self.model, self.optimizer = self.accelerator.prepare(self.model, self.optimizer)
         # Keep an unwrapped reference for direct submodule access (DDP does not
         # proxy __getattr__ to the underlying module in all PyTorch versions).
-        self.unwrapped = self.accelerator.unwrap_model(self.model)
+        self.unwrapped = self.model
+        self.model, self.optimizer = self.accelerator.prepare(self.model, self.optimizer)
 
     # ------------------------------------------------------------------
     # Helpers
