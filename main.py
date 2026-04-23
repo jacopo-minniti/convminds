@@ -30,6 +30,7 @@ def main():
     parser.add_argument("--dropout", type=float, default=0.1, help="Dropout rate for the adapter")
     parser.add_argument("--weight-decay", type=float, default=0.01, help="L2 regularization (weight decay) for AdamW")
     parser.add_argument("--batch-size", type=int, default=32, help="Batch size per GPU")
+    parser.add_argument("--tr-window", type=str, default="1,5", help="BOLD window offset relative to TR X (default: 1,5 for X+1 to X+4)")
     parser.add_argument("--subject", type=str, default="S1", help="Subject ID (e.g., S1, S2)")
     parser.add_argument("--llm", type=str, default="gpt2", help="Base LLM ID from HuggingFace")
     parser.add_argument("--layers", type=str, default="6", help="Comma-separated injection layers (e.g., 2,6,10)")
@@ -38,11 +39,12 @@ def main():
     cm.set_seed(0)
     phase_epochs = [int(e) for e in args.epochs.split(",")]
     injection_layers = [int(l) for l in args.layers.split(",")]
+    tr_window = tuple(int(x) for x in args.tr_window.split(","))
 
     # 1. Dataset & DataLoaders
-    logger.info(f"Initializing Huth Alignment Dataset for Subject {args.subject}...")
-    train_set = HuthAlignmentDataset(subject_ids=[args.subject], split="train")
-    test_set = HuthAlignmentDataset(subject_ids=[args.subject], split="test")
+    logger.info(f"Initializing Huth Alignment Dataset for Subject {args.subject} (TR Window: {tr_window})...")
+    train_set = HuthAlignmentDataset(subject_ids=[args.subject], split="train", tr_window=tr_window)
+    test_set = HuthAlignmentDataset(subject_ids=[args.subject], split="test", tr_window=tr_window)
 
     train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True, drop_last=True)
     test_loader = DataLoader(test_set, batch_size=args.batch_size, shuffle=False)

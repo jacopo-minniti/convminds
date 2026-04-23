@@ -15,10 +15,11 @@ class HuthAlignmentDataset(Dataset):
     - Story Context: TR X-3 to X-1
     - Brain Input: BOLD TR X+1 to X+4 (capturing HRF lag)
     """
-    def __init__(self, subject_ids=["S1"], split="train", pca_dim=1000):
+    def __init__(self, subject_ids=["S1"], split="train", pca_dim=1000, tr_window=(1, 5)):
         self.bold_data = {}
         self.story_metadata = {}
         self.all_samples = []
+        self.tr_window = tr_window
         
         # Load and preprocess
         for subj in subject_ids:
@@ -86,7 +87,8 @@ class HuthAlignmentDataset(Dataset):
 
     def __getitem__(self, index):
         subj, story, x = self.all_samples[index]
-        bold_window = self.bold_data[subj][story][x+1:x+5]
+        w_start, w_end = self.tr_window
+        bold_window = self.bold_data[subj][story][x+w_start:x+w_end]
         
         metadata = self.story_metadata[story]
         tr_times = metadata["tr_times"]
