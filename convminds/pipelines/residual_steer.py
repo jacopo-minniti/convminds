@@ -58,33 +58,38 @@ class ResidualSteerPipeline(BasePipeline):
                 for batch in pbar:
                     B = batch["bold"].to(self.device)
                     
-                    # Extract context and target hidden states for ALL layers
+                    # 1. Unified Tokenization to handle BPE space sensitivity
+                    # We tokenize the full sequence to get correct word-boundary tokens
+                    full_texts = [c + " " + t for c, t in zip(batch["context"], batch["target"])]
+                    full_enc = self.model.tokenizer(full_texts, return_tensors="pt", padding=True, truncation=True)
+                    full_ids = full_enc.input_ids.to(self.device)
+                    full_mask = full_enc.attention_mask.to(self.device)
+                    
+                    # Also need just context to find the split point
                     ctx_enc = self.model.tokenizer(batch["context"], return_tensors="pt", padding=True, truncation=True)
-                    tgt_enc = self.model.tokenizer(batch["target"], return_tensors="pt", padding=True, truncation=True)
+                    ctx_lens = ctx_enc.attention_mask.sum(dim=1)
                     
-                    ctx_ids, ctx_mask = ctx_enc.input_ids.to(self.device), ctx_enc.attention_mask.to(self.device)
-                    tgt_ids, tgt_mask = tgt_enc.input_ids.to(self.device), tgt_enc.attention_mask.to(self.device)
-                    
-                    # 1. Capture ALL layer hidden states at once efficiently
+                    # 2. Capture ALL layer hidden states at once efficiently
                     with torch.no_grad():
-                        ctx_out = self.model.llm(ctx_ids, attention_mask=ctx_mask, output_hidden_states=True)
-                        tgt_out = self.model.llm(tgt_ids, attention_mask=tgt_mask, output_hidden_states=True)
+                        full_out = self.model.llm(full_ids, attention_mask=full_mask, output_hidden_states=True)
                     
                     total_mse = 0
                     for layer in self.model.injection_layers:
-                        H_query = ctx_out.hidden_states[layer][:, -1:, :]
+                        batch_mse = 0
+                        for i in range(B.shape[0]):
+                            split_idx = ctx_lens[i].item()
+                            H_query = full_out.hidden_states[layer][i, split_idx-1 : split_idx, :]
+                            
+                            # Target is everything after the split
+                            H_target_raw = full_out.hidden_states[layer][i, split_idx:, :]
+                            mask_i = full_mask[i, split_idx:].float().unsqueeze(-1)
+                            H_target = torch.sum(H_target_raw * mask_i, dim=0, keepdim=True) / mask_i.sum().clamp(min=1e-8)
+                            
+                            delta_target = H_target - H_query
+                            v_steer = self.model.adapters[str(layer)](B[i:i+1], H_query)
+                            batch_mse += F.mse_loss(v_steer, delta_target)
                         
-                        # Masked mean for target signal at this layer
-                        H_target_raw = tgt_out.hidden_states[layer]
-                        mask_expanded = tgt_mask.unsqueeze(-1).float()
-                        sum_h = torch.sum(H_target_raw * mask_expanded, dim=1, keepdim=True)
-                        count = torch.sum(mask_expanded, dim=1, keepdim=True).clamp(min=1e-8)
-                        H_target = sum_h / count
-                        
-                        delta_target = H_target - H_query
-                        v_steer = self.model.adapters[str(layer)](B, H_query)
-                        
-                        total_mse += F.mse_loss(v_steer, delta_target)
+                        total_mse += (batch_mse / B.shape[0])
                     
                     loss = total_mse / len(self.model.injection_layers)
                     
@@ -105,28 +110,31 @@ class ResidualSteerPipeline(BasePipeline):
                     with torch.no_grad():
                         for batch in eval_loader:
                             B = batch["bold"].to(self.device)
+                            full_texts = [c + " " + t for c, t in zip(batch["context"], batch["target"])]
+                            full_enc = self.model.tokenizer(full_texts, return_tensors="pt", padding=True, truncation=True)
+                            full_ids = full_enc.input_ids.to(self.device)
+                            full_mask = full_enc.attention_mask.to(self.device)
+                            
                             ctx_enc = self.model.tokenizer(batch["context"], return_tensors="pt", padding=True, truncation=True)
-                            tgt_enc = self.model.tokenizer(batch["target"], return_tensors="pt", padding=True, truncation=True)
+                            ctx_lens = ctx_enc.attention_mask.sum(dim=1)
                             
-                            ctx_ids, ctx_mask = ctx_enc.input_ids.to(self.device), ctx_enc.attention_mask.to(self.device)
-                            tgt_ids, tgt_mask = tgt_enc.input_ids.to(self.device), tgt_enc.attention_mask.to(self.device)
-                            
-                            ctx_out = self.model.llm(ctx_ids, attention_mask=ctx_mask, output_hidden_states=True)
-                            tgt_out = self.model.llm(tgt_ids, attention_mask=tgt_mask, output_hidden_states=True)
+                            full_out = self.model.llm(full_ids, attention_mask=full_mask, output_hidden_states=True)
                             
                             batch_mse = 0
                             for layer in self.model.injection_layers:
-                                H_query = ctx_out.hidden_states[layer][:, -1:, :]
-                                
-                                H_target_raw = tgt_out.hidden_states[layer]
-                                mask_expanded = tgt_mask.unsqueeze(-1).float()
-                                sum_h = torch.sum(H_target_raw * mask_expanded, dim=1, keepdim=True)
-                                count = torch.sum(mask_expanded, dim=1, keepdim=True).clamp(min=1e-8)
-                                H_target = sum_h / count
-                                
-                                delta_target = H_target - H_query
-                                v_steer = self.model.adapters[str(layer)](B, H_query)
-                                batch_mse += F.mse_loss(v_steer, delta_target)
+                                layer_mse = 0
+                                for i in range(B.shape[0]):
+                                    split_idx = ctx_lens[i].item()
+                                    H_query = full_out.hidden_states[layer][i, split_idx-1 : split_idx, :]
+                                    
+                                    H_target_raw = full_out.hidden_states[layer][i, split_idx:, :]
+                                    mask_i = full_mask[i, split_idx:].float().unsqueeze(-1)
+                                    H_target = torch.sum(H_target_raw * mask_i, dim=0, keepdim=True) / mask_i.sum().clamp(min=1e-8)
+                                    
+                                    delta_target = H_target - H_query
+                                    v_steer = self.model.adapters[str(layer)](B[i:i+1], H_query)
+                                    layer_mse += F.mse_loss(v_steer, delta_target)
+                                batch_mse += (layer_mse / B.shape[0])
                             
                             val_losses.append((batch_mse / len(self.model.injection_layers)).item())
                     
@@ -150,27 +158,35 @@ class ResidualSteerPipeline(BasePipeline):
                 for batch in pbar:
                     B = batch["bold"].to(self.device)
                     
-                    # Construction of steers for multi-token phrase loss
-                    context_raw = batch["context"]
-                    target_raw = batch["target"]
+                    # Unified Tokenization
+                    full_texts = [c + " " + t for c, t in zip(batch["context"], batch["target"])]
+                    full_enc = self.model.tokenizer(full_texts, return_tensors="pt", padding=True, truncation=True)
+                    full_ids = full_enc.input_ids.to(self.device)
+                    full_mask = full_enc.attention_mask.to(self.device)
                     
-                    ctx_enc = self.model.tokenizer(context_raw, return_tensors="pt", padding=True, truncation=True)
-                    tgt_enc = self.model.tokenizer(target_raw, return_tensors="pt", padding=True, truncation=True)
+                    ctx_enc = self.model.tokenizer(batch["context"], return_tensors="pt", padding=True, truncation=True)
+                    ctx_lens = ctx_enc.attention_mask.sum(dim=1)
                     
-                    ctx_ids, ctx_mask = ctx_enc.input_ids.to(self.device), ctx_enc.attention_mask.to(self.device)
-                    tgt_ids, tgt_mask = tgt_enc.input_ids.to(self.device), tgt_enc.attention_mask.to(self.device)
+                    # We start steering from the last context token to predict the first target token
+                    # max_tgt_len is full_ids.shape[1] - ctx_lens.min()
+                    # But since we have padding, it's safer to use the hook on the whole thing 
+                    # and ensure num_steer_tokens is large enough.
+                    max_steer = full_ids.shape[1] # Simple upper bound
                     
-                    full_ids = torch.cat([ctx_ids, tgt_ids], dim=1)
-                    full_mask = torch.cat([ctx_mask, tgt_mask], dim=1)
-                    num_steer = tgt_ids.shape[1] + 1
+                    logits, _ = self.model.forward_steered(full_ids, B, num_steer_tokens=max_steer, attention_mask=full_mask)
                     
-                    logits, _ = self.model.forward_steered(full_ids, B, num_steer_tokens=num_steer, attention_mask=full_mask)
+                    # Calculate loss ONLY on the target positions
+                    batch_loss = 0
+                    for i in range(B.shape[0]):
+                        start_idx = ctx_lens[i].item() - 1
+                        end_idx = full_ids.shape[1] - 1
+                        
+                        target_logits = logits[i, start_idx:end_idx, :]
+                        target_labels = full_ids[i, start_idx+1:]
+                        
+                        batch_loss += criterion(target_logits, target_labels)
                     
-                    start_idx = ctx_ids.shape[1] - 1
-                    end_idx = full_ids.shape[1] - 1
-                    logits_at_target_positions = logits[:, start_idx:end_idx, :].reshape(-1, logits.size(-1))
-                    target_labels = full_ids[:, start_idx+1:].reshape(-1)
-                    loss = criterion(logits_at_target_positions, target_labels)
+                    loss = batch_loss / B.shape[0]
                     
                     self.optimizer.zero_grad()
                     loss.backward()
@@ -190,26 +206,25 @@ class ResidualSteerPipeline(BasePipeline):
                     with torch.no_grad():
                         for batch in eval_loader:
                             B = batch["bold"].to(self.device)
-                            context_raw = batch["context"]
-                            target_raw = batch["target"]
+                            full_texts = [c + " " + t for c, t in zip(batch["context"], batch["target"])]
+                            full_enc = self.model.tokenizer(full_texts, return_tensors="pt", padding=True, truncation=True)
+                            full_ids = full_enc.input_ids.to(self.device)
+                            full_mask = full_enc.attention_mask.to(self.device)
                             
-                            # Multi-token validation
-                            ctx_enc = self.model.tokenizer(context_raw, return_tensors="pt", padding=True, truncation=True)
-                            tgt_enc = self.model.tokenizer(target_raw, return_tensors="pt", padding=True, truncation=True)
-                            ctx_ids, ctx_mask = ctx_enc.input_ids.to(self.device), ctx_enc.attention_mask.to(self.device)
-                            tgt_ids, tgt_mask = tgt_enc.input_ids.to(self.device), tgt_enc.attention_mask.to(self.device)
+                            ctx_enc = self.model.tokenizer(batch["context"], return_tensors="pt", padding=True, truncation=True)
+                            ctx_lens = ctx_enc.attention_mask.sum(dim=1)
                             
-                            full_ids = torch.cat([ctx_ids, tgt_ids], dim=1)
-                            full_mask = torch.cat([ctx_mask, tgt_mask], dim=1)
-                            num_steer = tgt_ids.shape[1] + 1
+                            max_steer = full_ids.shape[1]
+                            logits, _ = self.model.forward_steered(full_ids, B, num_steer_tokens=max_steer, attention_mask=full_mask)
                             
-                            logits, _ = self.model.forward_steered(full_ids, B, num_steer_tokens=num_steer, attention_mask=full_mask)
-                            
-                            start_idx = ctx_ids.shape[1] - 1
-                            end_idx = full_ids.shape[1] - 1
-                            logits_at_target_positions = logits[:, start_idx:end_idx, :].reshape(-1, logits.size(-1))
-                            target_labels = full_ids[:, start_idx+1:].reshape(-1)
-                            val_losses.append(criterion(logits_at_target_positions, target_labels).item())
+                            batch_loss = 0
+                            for i in range(B.shape[0]):
+                                start_idx = ctx_lens[i].item() - 1
+                                end_idx = full_ids.shape[1] - 1
+                                target_logits = logits[i, start_idx:end_idx, :]
+                                target_labels = full_ids[i, start_idx+1:]
+                                batch_loss += criterion(target_logits, target_labels)
+                            val_losses.append((batch_loss / B.shape[0]).item())
                     
                     val_avg = np.mean(val_losses)
                     log_str += f" | Val CE: {val_avg:.6f}"
@@ -247,39 +262,52 @@ class ResidualSteerPipeline(BasePipeline):
         with torch.no_grad():
             for batch in tqdm(test_loader, desc="Evaluation"):
                 B = batch["bold"].to(self.device)
+                
+                # Unified Tokenization for Ground Truth tokens
+                full_texts = [c + " " + t for c, t in zip(batch["context"], batch["target"])]
+                full_enc = self.model.tokenizer(full_texts, return_tensors="pt", padding=True, truncation=True)
+                full_ids = full_enc.input_ids.to(self.device)
+                full_mask = full_enc.attention_mask.to(self.device)
+                
                 ctx_enc = self.model.tokenizer(batch["context"], return_tensors="pt", padding=True, truncation=True)
-                input_ids, attention_mask = ctx_enc.input_ids.to(self.device), ctx_enc.attention_mask.to(self.device)
+                ctx_ids = ctx_enc.input_ids.to(self.device)
+                ctx_mask = ctx_enc.attention_mask.to(self.device)
+                ctx_lens = ctx_mask.sum(dim=1)
                 
-                # Single-token prediction targets
-                target_tokens = [self.model.tokenizer.encode(" " + t)[0] if len(t) > 0 else self.model.tokenizer.eos_token_id for t in batch["target"]]
-                target_label = torch.tensor(target_tokens, device=self.device)
+                # 1. Baseline: GPT-2 (Base model predicts from context only)
+                outputs_base = self.model.llm(ctx_ids, attention_mask=ctx_mask)
                 
-                # 1. Baseline: GPT-2 (Single Token for Accuracy, Multi-Token for Sequence Metrics)
-                outputs_base = self.model.llm(input_ids, attention_mask=attention_mask)
-                preds_base_single = torch.argmax(outputs_base.logits[:, -1, :], dim=-1)
-                correct_base += (preds_base_single == target_label).sum().item()
+                # 2. Intervention: Steered
+                logits_steered, _ = self.model.forward_steered(ctx_ids, B, attention_mask=ctx_mask)
                 
-                gen_base = self.model.llm.generate(input_ids, max_new_tokens=max_new_tokens, attention_mask=attention_mask, pad_token_id=self.model.tokenizer.pad_token_id)
-                new_tokens_base = gen_base[:, input_ids.shape[1]:]
+                # Accuracy check: compare predictions for the first token after the context
+                for i in range(B.shape[0]):
+                    split_idx = ctx_lens[i].item()
+                    # The ground truth first target token from the unified tokenization
+                    target_token = full_ids[i, split_idx]
+                    
+                    pred_base = torch.argmax(outputs_base.logits[i, split_idx-1, :])
+                    pred_steered = torch.argmax(logits_steered[i, split_idx-1, :])
+                    
+                    correct_base += (pred_base == target_token).item()
+                    correct_steered += (pred_steered == target_token).item()
+                    
+                    random_token = torch.randint(0, self.model.tokenizer.vocab_size, (1,), device=self.device)
+                    correct_random += (random_token == target_token).item()
+                    total += 1
+                
+                # Sequence metrics
+                gen_base = self.model.llm.generate(ctx_ids, max_new_tokens=max_new_tokens, attention_mask=ctx_mask, pad_token_id=self.model.tokenizer.pad_token_id)
+                new_tokens_base = gen_base[:, ctx_ids.shape[1]:]
                 text_base = self.model.tokenizer.batch_decode(new_tokens_base, skip_special_tokens=True)
                 all_preds_base.extend(text_base)
                 
-                # 2. Intervention: Steered (Single Token for Accuracy, Multi-Token for Sequence Metrics)
-                logits_steered, _ = self.model.forward_steered(input_ids, B, attention_mask=attention_mask)
-                preds_steered_single = torch.argmax(logits_steered[:, -1, :], dim=-1)
-                correct_steered += (preds_steered_single == target_label).sum().item()
-                
-                gen_steered = self.model.generate_steered(input_ids, B, max_new_tokens=max_new_tokens, attention_mask=attention_mask)
-                new_tokens_steered = gen_steered[:, input_ids.shape[1]:]
+                gen_steered = self.model.generate_steered(ctx_ids, B, max_new_tokens=max_new_tokens, attention_mask=ctx_mask)
+                new_tokens_steered = gen_steered[:, ctx_ids.shape[1]:]
                 text_steered = self.model.tokenizer.batch_decode(new_tokens_steered, skip_special_tokens=True)
                 all_preds_steered.extend(text_steered)
                 
-                # 3. Reference and Random
                 all_refs.extend(batch["target"])
-                random_preds = torch.randint(0, self.model.tokenizer.vocab_size, (target_label.size(0),), device=self.device)
-                correct_random += (random_preds == target_label).sum().item()
-                
-                total += target_label.size(0)
                 
                 # Qualitative samples
                 while shown_samples < samples_to_show and shown_samples < len(batch["context"]):
