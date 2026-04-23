@@ -78,12 +78,12 @@ class ResidualSteerPipeline(BasePipeline):
                         batch_mse = 0
                         for i in range(B.shape[0]):
                             split_idx = ctx_lens[i].item()
-                            H_query = full_out.hidden_states[layer][i, split_idx-1 : split_idx, :]
+                            H_query = full_out.hidden_states[layer][i:i+1, split_idx-1 : split_idx, :]
                             
                             # Target is everything after the split
-                            H_target_raw = full_out.hidden_states[layer][i, split_idx:, :]
-                            mask_i = full_mask[i, split_idx:].float().unsqueeze(-1)
-                            H_target = torch.sum(H_target_raw * mask_i, dim=0, keepdim=True) / mask_i.sum().clamp(min=1e-8)
+                            H_target_raw = full_out.hidden_states[layer][i:i+1, split_idx:, :]
+                            mask_i = full_mask[i:i+1, split_idx:].float().unsqueeze(-1)
+                            H_target = torch.sum(H_target_raw * mask_i, dim=1, keepdim=True) / mask_i.sum(dim=1, keepdim=True).clamp(min=1e-8)
                             
                             delta_target = H_target - H_query
                             v_steer = self.model.adapters[str(layer)](B[i:i+1], H_query)
@@ -125,11 +125,11 @@ class ResidualSteerPipeline(BasePipeline):
                                 layer_mse = 0
                                 for i in range(B.shape[0]):
                                     split_idx = ctx_lens[i].item()
-                                    H_query = full_out.hidden_states[layer][i, split_idx-1 : split_idx, :]
+                                    H_query = full_out.hidden_states[layer][i:i+1, split_idx-1 : split_idx, :]
                                     
-                                    H_target_raw = full_out.hidden_states[layer][i, split_idx:, :]
-                                    mask_i = full_mask[i, split_idx:].float().unsqueeze(-1)
-                                    H_target = torch.sum(H_target_raw * mask_i, dim=0, keepdim=True) / mask_i.sum().clamp(min=1e-8)
+                                    H_target_raw = full_out.hidden_states[layer][i:i+1, split_idx:, :]
+                                    mask_i = full_mask[i:i+1, split_idx:].float().unsqueeze(-1)
+                                    H_target = torch.sum(H_target_raw * mask_i, dim=1, keepdim=True) / mask_i.sum(dim=1, keepdim=True).clamp(min=1e-8)
                                     
                                     delta_target = H_target - H_query
                                     v_steer = self.model.adapters[str(layer)](B[i:i+1], H_query)
