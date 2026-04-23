@@ -403,9 +403,3 @@ class ResidualSteerPipeline(BasePipeline):
         with torch.no_grad():
             logits, _ = self.model.forward_steered(input_ids, brain_batch, **kwargs)
         return logits
-:
-        """Standard steering inference."""
-        self.model.adapters.eval()
-        with torch.no_grad():
-            logits, _ = self.model.forward_steered(input_ids, brain_batch, **kwargs)
-        return logits
