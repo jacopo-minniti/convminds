@@ -219,7 +219,11 @@ class ResidualSteerPipeline(BasePipeline):
                             
                             batch_loss = 0
                             for i in range(B.shape[0]):
-                                start_idx = ctx_lens[i].item() - 1
+                                pad_len_i = int(full_ids.shape[1] - full_mask[i].sum().item())
+                                split_idx = pad_len_i + int(ctx_lens[i].item())
+                                split_idx = min(max(split_idx, pad_len_i + 1), full_ids.shape[1] - 1)
+                                
+                                start_idx = split_idx - 1
                                 end_idx = full_ids.shape[1] - 1
                                 target_logits = logits[i, start_idx:end_idx, :]
                                 target_labels = full_ids[i, start_idx+1:]
