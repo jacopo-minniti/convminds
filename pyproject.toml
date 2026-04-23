@@ -23,7 +23,8 @@ dependencies = [
     "datasets",
     "evaluate",
     "rouge_score",
-    "jiwer"
+    "jiwer",
+    "h5py"
 ]
 
 [build-system]
