@@ -73,11 +73,17 @@ class HuthAlignmentDataset(Dataset):
                 
                 actual_trs = projected.shape[0]
                 test_start = int(actual_trs * 0.9)
-                tr_range = range(3, actual_trs - 4)
+                
+                w_start, w_end = self.tr_window
+                min_start = max(3, -w_start)
+                end_offset = max(1, w_end) - 1
+                
                 if split == "train":
-                    tr_range = range(3, test_start - 4)
+                    tr_range = range(min_start, test_start - end_offset)
                 elif split == "test":
-                    tr_range = range(test_start, actual_trs - 4)
+                    tr_range = range(max(test_start, min_start), actual_trs - end_offset)
+                else:
+                    tr_range = range(min_start, actual_trs - end_offset)
                 
                 for x in tr_range:
                     self.all_samples.append((subj, story_name, x))
