@@ -55,6 +55,9 @@ class ResidualSteerPipeline(BasePipeline):
         self.model = model.to(self.device)
         self.optimizer = AdamW(self.model.adapters.parameters(), lr=lr, weight_decay=weight_decay)
         self.model, self.optimizer = self.accelerator.prepare(self.model, self.optimizer)
+        # Keep an unwrapped reference for direct submodule access (DDP does not
+        # proxy __getattr__ to the underlying module in all PyTorch versions).
+        self.unwrapped = self.accelerator.unwrap_model(self.model)
 
     # ------------------------------------------------------------------
     # Helpers
@@ -63,11 +66,11 @@ class ResidualSteerPipeline(BasePipeline):
     def _tokenize(self, batch: dict, device: torch.device):
         """Unified tokenization: full sequence + context-only for split detection."""
         full_texts = [c + " " + t for c, t in zip(batch["context"], batch["target"])]
-        full_enc = self.model.tokenizer(full_texts, return_tensors="pt", padding=True, truncation=True)
+        full_enc = self.unwrapped.tokenizer(full_texts, return_tensors="pt", padding=True, truncation=True)
         full_ids = full_enc.input_ids.to(device)
         full_mask = full_enc.attention_mask.to(device)
 
-        ctx_enc = self.model.tokenizer(batch["context"], return_tensors="pt", padding=True, truncation=True)
+        ctx_enc = self.unwrapped.tokenizer(batch["context"], return_tensors="pt", padding=True, truncation=True)
         ctx_lens = ctx_enc.attention_mask.sum(dim=1).to(device)
 
         return full_ids, full_mask, ctx_lens
@@ -105,7 +108,7 @@ class ResidualSteerPipeline(BasePipeline):
         if phase_epochs[0] > 0:
             logger.info(f"Starting Phase 1: MSE Warmup ({phase_epochs[0]} epochs)")
             for epoch in range(1, phase_epochs[0] + 1):
-                self.model.adapters.train()
+                self.unwrapped.adapters.train()
                 epoch_losses = []
                 pbar = tqdm(train_loader, desc=f"Ph1 Ep {epoch}", disable=not is_main)
 
@@ -115,10 +118,10 @@ class ResidualSteerPipeline(BasePipeline):
                     full_ids, full_mask, ctx_lens = self._tokenize(batch, self.device)
 
                     with torch.no_grad():
-                        full_out = self.model.llm(full_ids, attention_mask=full_mask, output_hidden_states=True)
+                        full_out = self.unwrapped.llm(full_ids, attention_mask=full_mask, output_hidden_states=True)
 
                     layer_losses = []
-                    for layer in self.model.injection_layers:
+                    for layer in self.unwrapped.injection_layers:
                         item_losses = []
                         for i in range(B.shape[0]):
                             sidx = _split_idx(i, full_ids, full_mask, ctx_lens)
@@ -135,7 +138,7 @@ class ResidualSteerPipeline(BasePipeline):
                             )
 
                             delta_target = H_target - H_query
-                            v_steer = self.model.adapters[str(layer)](B[i:i+1], H_query)
+                            v_steer = self.unwrapped.adapters[str(layer)](B[i:i+1], H_query)
                             item_losses.append(F.mse_loss(v_steer, delta_target))
 
                         if item_losses:
@@ -168,12 +171,12 @@ class ResidualSteerPipeline(BasePipeline):
         if len(phase_epochs) > 1 and phase_epochs[1] > 0:
             logger.info(f"Starting Phase 2: CE Injection ({phase_epochs[1]} epochs)")
             # Reset optimizer: fresh moments and lower LR for CE fine-tuning.
-            self.optimizer = AdamW(self.model.adapters.parameters(), lr=self.lr_phase2, weight_decay=self.weight_decay)
+            self.optimizer = AdamW(self.unwrapped.adapters.parameters(), lr=self.lr_phase2, weight_decay=self.weight_decay)
             self.optimizer = self.accelerator.prepare(self.optimizer)
             criterion = nn.CrossEntropyLoss()
 
             for epoch in range(1, phase_epochs[1] + 1):
-                self.model.adapters.train()
+                self.unwrapped.adapters.train()
                 epoch_losses = []
                 pbar = tqdm(train_loader, desc=f"Ph2 Ep {epoch}", disable=not is_main)
 
@@ -183,7 +186,7 @@ class ResidualSteerPipeline(BasePipeline):
                     full_ids, full_mask, ctx_lens = self._tokenize(batch, self.device)
 
                     num_steer = self._num_steer_tokens(full_ids, full_mask, ctx_lens)
-                    # Call through DDP forward so gradient sync is handled correctly.
+                    # Call through self.model (DDP wrapper) so gradient sync is handled correctly.
                     logits, _ = self.model(B, full_ids, num_steer_tokens=num_steer, attention_mask=full_mask)
 
                     item_losses = []
@@ -226,17 +229,17 @@ class ResidualSteerPipeline(BasePipeline):
     # ------------------------------------------------------------------
 
     def _eval_phase1(self, eval_loader: DataLoader) -> float:
-        self.model.adapters.eval()
+        self.unwrapped.adapters.eval()
         val_losses = []
         with torch.no_grad():
             for batch in eval_loader:
                 B = torch.nan_to_num(batch["bold"].to(self.device), nan=0.0, posinf=0.0, neginf=0.0)
                 B = torch.clamp(B, min=-20.0, max=20.0)
                 full_ids, full_mask, ctx_lens = self._tokenize(batch, self.device)
-                full_out = self.model.llm(full_ids, attention_mask=full_mask, output_hidden_states=True)
+                full_out = self.unwrapped.llm(full_ids, attention_mask=full_mask, output_hidden_states=True)
 
                 layer_losses = []
-                for layer in self.model.injection_layers:
+                for layer in self.unwrapped.injection_layers:
                     item_losses = []
                     for i in range(B.shape[0]):
                         sidx = _split_idx(i, full_ids, full_mask, ctx_lens)
@@ -253,7 +256,7 @@ class ResidualSteerPipeline(BasePipeline):
                         )
 
                         delta_target = H_target - H_query
-                        v_steer = self.model.adapters[str(layer)](B[i:i+1], H_query)
+                        v_steer = self.unwrapped.adapters[str(layer)](B[i:i+1], H_query)
                         item_losses.append(F.mse_loss(v_steer, delta_target).item())
 
                     if item_losses:
@@ -266,7 +269,7 @@ class ResidualSteerPipeline(BasePipeline):
         return self._gather_mean(local_avg)
 
     def _eval_phase2(self, eval_loader: DataLoader, criterion: nn.Module) -> float:
-        self.model.adapters.eval()
+        self.unwrapped.adapters.eval()
         val_losses = []
         with torch.no_grad():
             for batch in eval_loader:
@@ -275,7 +278,7 @@ class ResidualSteerPipeline(BasePipeline):
                 full_ids, full_mask, ctx_lens = self._tokenize(batch, self.device)
 
                 num_steer = self._num_steer_tokens(full_ids, full_mask, ctx_lens)
-                logits, _ = self.model.forward_steered(full_ids, B, num_steer_tokens=num_steer, attention_mask=full_mask)
+                logits, _ = self.unwrapped.forward_steered(full_ids, B, num_steer_tokens=num_steer, attention_mask=full_mask)
 
                 item_losses = []
                 for i in range(B.shape[0]):
@@ -302,7 +305,7 @@ class ResidualSteerPipeline(BasePipeline):
         samples_to_show: int = 2,
         max_new_tokens: int = 15,
     ) -> dict[str, float]:
-        self.model.adapters.eval()
+        self.unwrapped.adapters.eval()
 
         correct_steered = correct_base = correct_random = total = 0
         all_preds_steered, all_preds_base, all_refs = [], [], []
@@ -315,12 +318,12 @@ class ResidualSteerPipeline(BasePipeline):
 
                 full_ids, full_mask, ctx_lens = self._tokenize(batch, self.device)
 
-                ctx_enc = self.model.tokenizer(batch["context"], return_tensors="pt", padding=True, truncation=True)
+                ctx_enc = self.unwrapped.tokenizer(batch["context"], return_tensors="pt", padding=True, truncation=True)
                 ctx_ids = ctx_enc.input_ids.to(self.device)
                 ctx_mask = ctx_enc.attention_mask.to(self.device)
 
-                outputs_base = self.model.llm(ctx_ids, attention_mask=ctx_mask)
-                logits_steered, _ = self.model.forward_steered(ctx_ids, B, attention_mask=ctx_mask)
+                outputs_base = self.unwrapped.llm(ctx_ids, attention_mask=ctx_mask)
+                logits_steered, _ = self.unwrapped.forward_steered(ctx_ids, B, attention_mask=ctx_mask)
 
                 for i in range(B.shape[0]):
                     sidx = _split_idx(i, full_ids, full_mask, ctx_lens)
@@ -333,15 +336,15 @@ class ResidualSteerPipeline(BasePipeline):
 
                     correct_base += (pred_base == target_token).item()
                     correct_steered += (pred_steered == target_token).item()
-                    correct_random += (torch.randint(0, self.model.tokenizer.vocab_size, (1,), device=self.device) == target_token).item()
+                    correct_random += (torch.randint(0, self.unwrapped.tokenizer.vocab_size, (1,), device=self.device) == target_token).item()
                     total += 1
 
-                gen_base = self.model.llm.generate(ctx_ids, max_new_tokens=max_new_tokens, attention_mask=ctx_mask, pad_token_id=self.model.tokenizer.pad_token_id)
-                text_base = self.model.tokenizer.batch_decode(gen_base[:, ctx_ids.shape[1]:], skip_special_tokens=True)
+                gen_base = self.unwrapped.llm.generate(ctx_ids, max_new_tokens=max_new_tokens, attention_mask=ctx_mask, pad_token_id=self.unwrapped.tokenizer.pad_token_id)
+                text_base = self.unwrapped.tokenizer.batch_decode(gen_base[:, ctx_ids.shape[1]:], skip_special_tokens=True)
                 all_preds_base.extend(text_base)
 
-                gen_steered = self.model.generate_steered(ctx_ids, B, max_new_tokens=max_new_tokens, attention_mask=ctx_mask)
-                text_steered = self.model.tokenizer.batch_decode(gen_steered[:, ctx_ids.shape[1]:], skip_special_tokens=True)
+                gen_steered = self.unwrapped.generate_steered(ctx_ids, B, max_new_tokens=max_new_tokens, attention_mask=ctx_mask)
+                text_steered = self.unwrapped.tokenizer.batch_decode(gen_steered[:, ctx_ids.shape[1]:], skip_special_tokens=True)
                 all_preds_steered.extend(text_steered)
 
                 all_refs.extend(batch["target"])
@@ -362,7 +365,6 @@ class ResidualSteerPipeline(BasePipeline):
         counters = self.accelerator.reduce(counters, reduction="sum")
         correct_steered, correct_base, correct_random, total = [int(x) for x in counters.tolist()]
 
-        # Text metrics computed on each process's local shard; logged on main process only.
         steered_metrics = calculate_text_report(all_preds_steered, all_refs)
         base_metrics = calculate_text_report(all_preds_base, all_refs)
 
@@ -387,7 +389,7 @@ class ResidualSteerPipeline(BasePipeline):
         return results
 
     def predict(self, input_ids: torch.Tensor, brain_batch: torch.Tensor, **kwargs):
-        self.model.adapters.eval()
+        self.unwrapped.adapters.eval()
         with torch.no_grad():
-            logits, _ = self.model.forward_steered(input_ids, brain_batch, **kwargs)
+            logits, _ = self.unwrapped.forward_steered(input_ids, brain_batch, **kwargs)
         return logits
