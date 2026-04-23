@@ -75,24 +75,40 @@ class ResidualSteerPipeline(BasePipeline):
                         full_out = self.model.llm(full_ids, attention_mask=full_mask, output_hidden_states=True)
                     
                     total_mse = 0
+                    valid_count = 0
                     for layer in self.model.injection_layers:
-                        batch_mse = 0
+                        layer_mse = 0
+                        layer_count = 0
                         for i in range(B.shape[0]):
-                            split_idx = ctx_lens[i].item()
+                            pad_len_i = int(full_ids.shape[1] - full_mask[i].sum().item())
+                            split_idx = pad_len_i + int(ctx_lens[i].item())
+
+                            if split_idx >= full_ids.shape[1]:
+                                continue
+
+                            split_idx = max(split_idx, pad_len_i + 1)
                             H_query = full_out.hidden_states[layer][i:i+1, split_idx-1 : split_idx, :]
-                            
-                            # Target is everything after the split
+
                             H_target_raw = full_out.hidden_states[layer][i:i+1, split_idx:, :]
                             mask_i = full_mask[i:i+1, split_idx:].float().unsqueeze(-1)
                             H_target = torch.sum(H_target_raw * mask_i, dim=1, keepdim=True) / mask_i.sum(dim=1, keepdim=True).clamp(min=1e-8)
-                            
+
                             delta_target = H_target - H_query
                             v_steer = self.model.adapters[str(layer)](B[i:i+1], H_query)
-                            batch_mse += F.mse_loss(v_steer, delta_target)
-                        
-                        total_mse += (batch_mse / B.shape[0])
+                            if type(layer_mse) is int:
+                                layer_mse = F.mse_loss(v_steer, delta_target)
+                            else:
+                                layer_mse = layer_mse + F.mse_loss(v_steer, delta_target)
+                            layer_count += 1
+
+                        if layer_count > 0:
+                            total_mse += layer_mse / layer_count
+                            valid_count += 1
+
+                    if valid_count == 0:
+                        continue
                     
-                    loss = total_mse / len(self.model.injection_layers)
+                    loss = total_mse / valid_count
                     
                     self.optimizer.zero_grad()
                     loss.backward()
