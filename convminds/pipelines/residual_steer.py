@@ -109,7 +109,7 @@ class ResidualSteerPipeline(BasePipeline):
                     val_losses = []
                     with torch.no_grad():
                         for batch in eval_loader:
-                            B = batch["bold"].to(self.device)
+                            B = torch.nan_to_num(batch["bold"].to(self.device), nan=0.0)
                             full_texts = [c + " " + t for c, t in zip(batch["context"], batch["target"])]
                             full_enc = self.model.tokenizer(full_texts, return_tensors="pt", padding=True, truncation=True)
                             full_ids = full_enc.input_ids.to(self.device)
@@ -123,8 +123,16 @@ class ResidualSteerPipeline(BasePipeline):
                             batch_mse = 0
                             for layer in self.model.injection_layers:
                                 layer_mse = 0
+                                valid_items = 0
                                 for i in range(B.shape[0]):
-                                    split_idx = ctx_lens[i].item()
+                                    pad_len_i = int(full_ids.shape[1] - full_mask[i].sum().item())
+                                    split_idx = pad_len_i + int(ctx_lens[i].item())
+                                    
+                                    if split_idx >= full_ids.shape[1]:
+                                        continue
+                                        
+                                    split_idx = max(split_idx, pad_len_i + 1)
+
                                     H_query = full_out.hidden_states[layer][i:i+1, split_idx-1 : split_idx, :]
                                     
                                     H_target_raw = full_out.hidden_states[layer][i:i+1, split_idx:, :]
@@ -133,8 +141,15 @@ class ResidualSteerPipeline(BasePipeline):
                                     
                                     delta_target = H_target - H_query
                                     v_steer = self.model.adapters[str(layer)](B[i:i+1], H_query)
-                                    layer_mse += F.mse_loss(v_steer, delta_target)
-                                batch_mse += (layer_mse / B.shape[0])
+                                    
+                                    if type(layer_mse) is int:
+                                        layer_mse = F.mse_loss(v_steer, delta_target)
+                                    else:
+                                        layer_mse = layer_mse + F.mse_loss(v_steer, delta_target)
+                                    valid_items += 1
+                                    
+                                if valid_items > 0:
+                                    batch_mse += (layer_mse / valid_items)
                             
                             val_losses.append((batch_mse / len(self.model.injection_layers)).item())
                     
@@ -156,7 +171,7 @@ class ResidualSteerPipeline(BasePipeline):
                 pbar = tqdm(train_loader, desc=f"Ph2 Ep {epoch}")
                 
                 for batch in pbar:
-                    B = batch["bold"].to(self.device)
+                    B = torch.nan_to_num(batch["bold"].to(self.device), nan=0.0)
                     
                     # Unified Tokenization
                     full_texts = [c + " " + t for c, t in zip(batch["context"], batch["target"])]
@@ -177,16 +192,33 @@ class ResidualSteerPipeline(BasePipeline):
                     
                     # Calculate loss ONLY on the target positions
                     batch_loss = 0
+                    valid_items = 0
                     for i in range(B.shape[0]):
-                        start_idx = ctx_lens[i].item() - 1
+                        pad_len_i = int(full_ids.shape[1] - full_mask[i].sum().item())
+                        split_idx = pad_len_i + int(ctx_lens[i].item())
+                        
+                        if split_idx >= full_ids.shape[1]:
+                            continue
+                            
+                        split_idx = max(split_idx, pad_len_i + 1)
+                        
+                        start_idx = split_idx - 1
                         end_idx = full_ids.shape[1] - 1
                         
                         target_logits = logits[i, start_idx:end_idx, :]
                         target_labels = full_ids[i, start_idx+1:]
                         
-                        batch_loss += criterion(target_logits, target_labels)
+                        if type(batch_loss) is int:
+                            batch_loss = criterion(target_logits, target_labels)
+                        else:
+                            batch_loss = batch_loss + criterion(target_logits, target_labels)
+                        valid_items += 1
+                        
+                    if valid_items == 0:
+                        batch_loss = logits.sum() * 0.0
+                        valid_items = 1
                     
-                    loss = batch_loss / B.shape[0]
+                    loss = batch_loss / valid_items
                     
                     self.optimizer.zero_grad()
                     loss.backward()
@@ -205,7 +237,7 @@ class ResidualSteerPipeline(BasePipeline):
                     val_losses = []
                     with torch.no_grad():
                         for batch in eval_loader:
-                            B = batch["bold"].to(self.device)
+                            B = torch.nan_to_num(batch["bold"].to(self.device), nan=0.0)
                             full_texts = [c + " " + t for c, t in zip(batch["context"], batch["target"])]
                             full_enc = self.model.tokenizer(full_texts, return_tensors="pt", padding=True, truncation=True)
                             full_ids = full_enc.input_ids.to(self.device)
@@ -218,17 +250,29 @@ class ResidualSteerPipeline(BasePipeline):
                             logits, _ = self.model.forward_steered(full_ids, B, num_steer_tokens=max_steer, attention_mask=full_mask)
                             
                             batch_loss = 0
+                            valid_items = 0
                             for i in range(B.shape[0]):
                                 pad_len_i = int(full_ids.shape[1] - full_mask[i].sum().item())
                                 split_idx = pad_len_i + int(ctx_lens[i].item())
-                                split_idx = min(max(split_idx, pad_len_i + 1), full_ids.shape[1] - 1)
+                                
+                                if split_idx >= full_ids.shape[1]:
+                                    continue
+                                    
+                                split_idx = max(split_idx, pad_len_i + 1)
                                 
                                 start_idx = split_idx - 1
                                 end_idx = full_ids.shape[1] - 1
                                 target_logits = logits[i, start_idx:end_idx, :]
                                 target_labels = full_ids[i, start_idx+1:]
-                                batch_loss += criterion(target_logits, target_labels)
-                            val_losses.append((batch_loss / B.shape[0]).item())
+                                
+                                if type(batch_loss) is int:
+                                    batch_loss = criterion(target_logits, target_labels)
+                                else:
+                                    batch_loss = batch_loss + criterion(target_logits, target_labels)
+                                valid_items += 1
+                                
+                            if valid_items > 0:
+                                val_losses.append((batch_loss / valid_items).item())
                     
                     val_avg = np.mean(val_losses)
                     log_str += f" | Val CE: {val_avg:.6f}"
@@ -265,7 +309,7 @@ class ResidualSteerPipeline(BasePipeline):
         
         with torch.no_grad():
             for batch in tqdm(test_loader, desc="Evaluation"):
-                B = batch["bold"].to(self.device)
+                B = torch.nan_to_num(batch["bold"].to(self.device), nan=0.0)
                 
                 # Unified Tokenization for Ground Truth tokens
                 full_texts = [c + " " + t for c, t in zip(batch["context"], batch["target"])]
@@ -286,12 +330,19 @@ class ResidualSteerPipeline(BasePipeline):
                 
                 # Accuracy check: compare predictions for the first token after the context
                 for i in range(B.shape[0]):
-                    split_idx = ctx_lens[i].item()
+                    pad_len_i = int(full_ids.shape[1] - full_mask[i].sum().item())
+                    split_idx = pad_len_i + int(ctx_lens[i].item())
+                    
+                    if split_idx >= full_ids.shape[1]:
+                        continue # No valid target token to evaluate
+                        
+                    split_idx = max(split_idx, pad_len_i + 1)
+                    
                     # The ground truth first target token from the unified tokenization
                     target_token = full_ids[i, split_idx]
                     
-                    pred_base = torch.argmax(outputs_base.logits[i, split_idx-1, :])
-                    pred_steered = torch.argmax(logits_steered[i, split_idx-1, :])
+                    pred_base = torch.argmax(outputs_base.logits[i, -1, :])
+                    pred_steered = torch.argmax(logits_steered[i, -1, :])
                     
                     correct_base += (pred_base == target_token).item()
                     correct_steered += (pred_steered == target_token).item()
@@ -347,6 +398,12 @@ class ResidualSteerPipeline(BasePipeline):
         return results
 
     def predict(self, input_ids: torch.Tensor, brain_batch: torch.Tensor, **kwargs):
+        """Standard steering inference."""
+        self.model.adapters.eval()
+        with torch.no_grad():
+            logits, _ = self.model.forward_steered(input_ids, brain_batch, **kwargs)
+        return logits
+:
         """Standard steering inference."""
         self.model.adapters.eval()
         with torch.no_grad():
