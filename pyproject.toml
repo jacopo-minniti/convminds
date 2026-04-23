@@ -20,7 +20,10 @@ dependencies = [
     "pytest",
     "scikit-learn",
     "transformers>=4.11.3",
-    "datasets"
+    "datasets",
+    "evaluate",
+    "rouge_score",
+    "jiwer"
 ]
 
 [build-system]
