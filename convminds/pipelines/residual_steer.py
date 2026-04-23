@@ -56,7 +56,8 @@ class ResidualSteerPipeline(BasePipeline):
                 pbar = tqdm(train_loader, desc=f"Ph1 Ep {epoch}")
                 
                 for batch in pbar:
-                    B = batch["bold"].to(self.device)
+                    B = torch.nan_to_num(batch["bold"].to(self.device), nan=0.0, posinf=0.0, neginf=0.0)
+                    B = torch.clamp(B, min=-20.0, max=20.0)
                     
                     # 1. Unified Tokenization to handle BPE space sensitivity
                     # We tokenize the full sequence to get correct word-boundary tokens
@@ -109,7 +110,8 @@ class ResidualSteerPipeline(BasePipeline):
                     val_losses = []
                     with torch.no_grad():
                         for batch in eval_loader:
-                            B = torch.nan_to_num(batch["bold"].to(self.device), nan=0.0)
+                            B = torch.nan_to_num(batch["bold"].to(self.device), nan=0.0, posinf=0.0, neginf=0.0)
+                            B = torch.clamp(B, min=-20.0, max=20.0)
                             full_texts = [c + " " + t for c, t in zip(batch["context"], batch["target"])]
                             full_enc = self.model.tokenizer(full_texts, return_tensors="pt", padding=True, truncation=True)
                             full_ids = full_enc.input_ids.to(self.device)
@@ -171,7 +173,8 @@ class ResidualSteerPipeline(BasePipeline):
                 pbar = tqdm(train_loader, desc=f"Ph2 Ep {epoch}")
                 
                 for batch in pbar:
-                    B = torch.nan_to_num(batch["bold"].to(self.device), nan=0.0)
+                    B = torch.nan_to_num(batch["bold"].to(self.device), nan=0.0, posinf=0.0, neginf=0.0)
+                    B = torch.clamp(B, min=-20.0, max=20.0)
                     
                     # Unified Tokenization
                     full_texts = [c + " " + t for c, t in zip(batch["context"], batch["target"])]
@@ -237,7 +240,8 @@ class ResidualSteerPipeline(BasePipeline):
                     val_losses = []
                     with torch.no_grad():
                         for batch in eval_loader:
-                            B = torch.nan_to_num(batch["bold"].to(self.device), nan=0.0)
+                            B = torch.nan_to_num(batch["bold"].to(self.device), nan=0.0, posinf=0.0, neginf=0.0)
+                            B = torch.clamp(B, min=-20.0, max=20.0)
                             full_texts = [c + " " + t for c, t in zip(batch["context"], batch["target"])]
                             full_enc = self.model.tokenizer(full_texts, return_tensors="pt", padding=True, truncation=True)
                             full_ids = full_enc.input_ids.to(self.device)
@@ -309,7 +313,8 @@ class ResidualSteerPipeline(BasePipeline):
         
         with torch.no_grad():
             for batch in tqdm(test_loader, desc="Evaluation"):
-                B = torch.nan_to_num(batch["bold"].to(self.device), nan=0.0)
+                B = torch.nan_to_num(batch["bold"].to(self.device), nan=0.0, posinf=0.0, neginf=0.0)
+                B = torch.clamp(B, min=-20.0, max=20.0)
                 
                 # Unified Tokenization for Ground Truth tokens
                 full_texts = [c + " " + t for c, t in zip(batch["context"], batch["target"])]
