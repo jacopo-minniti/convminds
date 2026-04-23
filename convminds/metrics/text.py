@@ -9,8 +9,9 @@ def _get_evaluate():
     try:
         import evaluate
         return evaluate
-    except ImportError:
-        logger.error("The 'evaluate' library is not installed. Please run 'pip install evaluate rouge_score jiwer'.")
+    except (ImportError, TypeError, AttributeError) as e:
+        logger.error(f"The 'evaluate' library failed to import due to a system/dependency error: {e}")
+        logger.error("Tip: This is often caused by a bug in the 'datasets' library regarding 'jax'. Try running: pip install jax")
         return None
 
 def bleu_score(predictions: List[str], references: List[str], max_order: int = 1) -> float:
