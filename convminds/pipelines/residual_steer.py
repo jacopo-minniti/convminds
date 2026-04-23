@@ -58,7 +58,7 @@ class ResidualSteerPipeline(BasePipeline):
         full_mask = full_enc.attention_mask.to(device)
 
         ctx_enc = self.model.tokenizer(batch["context"], return_tensors="pt", padding=True, truncation=True)
-        ctx_lens = ctx_enc.attention_mask.sum(dim=1)
+        ctx_lens = ctx_enc.attention_mask.sum(dim=1).to(device)
 
         return full_ids, full_mask, ctx_lens
 
