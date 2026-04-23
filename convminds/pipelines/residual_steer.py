@@ -9,11 +9,14 @@ from tqdm import tqdm
 import numpy as np
 import logging
 
+from accelerate import Accelerator
+from accelerate.logging import get_logger
+
 from convminds.pipelines.base import BasePipeline
 from convminds.models.residual_steer import ResidualSteerLM
 from convminds.metrics.text import calculate_text_report
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__, log_level="INFO")
 
 
 def _split_idx(i: int, full_ids: torch.Tensor, full_mask: torch.Tensor, ctx_lens: torch.Tensor) -> int:
@@ -41,14 +44,17 @@ class ResidualSteerPipeline(BasePipeline):
         lr: float = 1e-4,
         lr_phase2: float | None = None,
         weight_decay: float = 0.01,
-        device: torch.device | None = None,
+        accelerator: Accelerator | None = None,
     ):
-        self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.model = model.to(self.device)
+        self.accelerator = accelerator or Accelerator()
+        self.device = self.accelerator.device
         self.lr = lr
         self.lr_phase2 = lr_phase2 if lr_phase2 is not None else lr / 3
         self.weight_decay = weight_decay
+
+        self.model = model.to(self.device)
         self.optimizer = AdamW(self.model.adapters.parameters(), lr=lr, weight_decay=weight_decay)
+        self.model, self.optimizer = self.accelerator.prepare(self.model, self.optimizer)
 
     # ------------------------------------------------------------------
     # Helpers
@@ -76,6 +82,11 @@ class ResidualSteerPipeline(BasePipeline):
         split_idxs = (pad_lens + ctx_lens).long()
         return max(1, full_ids.shape[1] - int(split_idxs.min().item()))
 
+    def _gather_mean(self, local_avg: float) -> float:
+        """Average a scalar metric across all processes."""
+        t = torch.tensor(local_avg, device=self.device)
+        return self.accelerator.gather(t).mean().item()
+
     # ------------------------------------------------------------------
     # Training
     # ------------------------------------------------------------------
@@ -88,6 +99,7 @@ class ResidualSteerPipeline(BasePipeline):
         eval_interval: int = 1,
     ) -> dict[str, float]:
         history = {}
+        is_main = self.accelerator.is_main_process
 
         # --- PHASE 1: MSE Warmup ---
         if phase_epochs[0] > 0:
@@ -95,7 +107,7 @@ class ResidualSteerPipeline(BasePipeline):
             for epoch in range(1, phase_epochs[0] + 1):
                 self.model.adapters.train()
                 epoch_losses = []
-                pbar = tqdm(train_loader, desc=f"Ph1 Ep {epoch}")
+                pbar = tqdm(train_loader, desc=f"Ph1 Ep {epoch}", disable=not is_main)
 
                 for batch in pbar:
                     B = torch.nan_to_num(batch["bold"].to(self.device), nan=0.0, posinf=0.0, neginf=0.0)
@@ -134,13 +146,14 @@ class ResidualSteerPipeline(BasePipeline):
 
                     loss = sum(layer_losses) / len(layer_losses)
                     self.optimizer.zero_grad()
-                    loss.backward()
+                    self.accelerator.backward(loss)
                     self.optimizer.step()
 
                     epoch_losses.append(loss.item())
                     pbar.set_postfix({"mse": f"{loss.item():.4f}"})
 
-                avg_loss = float(np.mean(epoch_losses)) if epoch_losses else float("nan")
+                local_avg = float(np.mean(epoch_losses)) if epoch_losses else float("nan")
+                avg_loss = self._gather_mean(local_avg)
                 log_str = f"Phase 1 | Ep {epoch} | Avg MSE: {avg_loss:.6f}"
 
                 if eval_loader and epoch % eval_interval == 0:
@@ -154,13 +167,15 @@ class ResidualSteerPipeline(BasePipeline):
         # --- PHASE 2: CE Injection ---
         if len(phase_epochs) > 1 and phase_epochs[1] > 0:
             logger.info(f"Starting Phase 2: CE Injection ({phase_epochs[1]} epochs)")
+            # Reset optimizer: fresh moments and lower LR for CE fine-tuning.
             self.optimizer = AdamW(self.model.adapters.parameters(), lr=self.lr_phase2, weight_decay=self.weight_decay)
+            self.optimizer = self.accelerator.prepare(self.optimizer)
             criterion = nn.CrossEntropyLoss()
 
             for epoch in range(1, phase_epochs[1] + 1):
                 self.model.adapters.train()
                 epoch_losses = []
-                pbar = tqdm(train_loader, desc=f"Ph2 Ep {epoch}")
+                pbar = tqdm(train_loader, desc=f"Ph2 Ep {epoch}", disable=not is_main)
 
                 for batch in pbar:
                     B = torch.nan_to_num(batch["bold"].to(self.device), nan=0.0, posinf=0.0, neginf=0.0)
@@ -168,7 +183,8 @@ class ResidualSteerPipeline(BasePipeline):
                     full_ids, full_mask, ctx_lens = self._tokenize(batch, self.device)
 
                     num_steer = self._num_steer_tokens(full_ids, full_mask, ctx_lens)
-                    logits, _ = self.model.forward_steered(full_ids, B, num_steer_tokens=num_steer, attention_mask=full_mask)
+                    # Call through DDP forward so gradient sync is handled correctly.
+                    logits, _ = self.model(B, full_ids, num_steer_tokens=num_steer, attention_mask=full_mask)
 
                     item_losses = []
                     for i in range(B.shape[0]):
@@ -185,13 +201,14 @@ class ResidualSteerPipeline(BasePipeline):
 
                     loss = sum(item_losses) / len(item_losses)
                     self.optimizer.zero_grad()
-                    loss.backward()
+                    self.accelerator.backward(loss)
                     self.optimizer.step()
 
                     epoch_losses.append(loss.item())
                     pbar.set_postfix({"ce_loss": f"{loss.item():.4f}"})
 
-                avg_loss = float(np.mean(epoch_losses)) if epoch_losses else float("nan")
+                local_avg = float(np.mean(epoch_losses)) if epoch_losses else float("nan")
+                avg_loss = self._gather_mean(local_avg)
                 log_str = f"Phase 2 | Ep {epoch} | Avg CE: {avg_loss:.6f}"
 
                 if eval_loader and epoch % eval_interval == 0:
@@ -245,7 +262,8 @@ class ResidualSteerPipeline(BasePipeline):
                 if layer_losses:
                     val_losses.append(float(np.mean(layer_losses)))
 
-        return float(np.mean(val_losses)) if val_losses else float("nan")
+        local_avg = float(np.mean(val_losses)) if val_losses else 0.0
+        return self._gather_mean(local_avg)
 
     def _eval_phase2(self, eval_loader: DataLoader, criterion: nn.Module) -> float:
         self.model.adapters.eval()
@@ -271,7 +289,8 @@ class ResidualSteerPipeline(BasePipeline):
                 if item_losses:
                     val_losses.append(float(np.mean(item_losses)))
 
-        return float(np.mean(val_losses)) if val_losses else float("nan")
+        local_avg = float(np.mean(val_losses)) if val_losses else 0.0
+        return self._gather_mean(local_avg)
 
     # ------------------------------------------------------------------
     # Evaluation
@@ -290,7 +309,7 @@ class ResidualSteerPipeline(BasePipeline):
         shown_samples = 0
 
         with torch.no_grad():
-            for batch in tqdm(test_loader, desc="Evaluation"):
+            for batch in tqdm(test_loader, desc="Evaluation", disable=not self.accelerator.is_main_process):
                 B = torch.nan_to_num(batch["bold"].to(self.device), nan=0.0, posinf=0.0, neginf=0.0)
                 B = torch.clamp(B, min=-20.0, max=20.0)
 
@@ -335,6 +354,15 @@ class ResidualSteerPipeline(BasePipeline):
                     logger.info(f"Steered:     \"{text_steered[shown_samples].strip()}\"")
                     shown_samples += 1
 
+        # Gather accuracy counters across all processes for correct global metrics.
+        counters = torch.tensor(
+            [correct_steered, correct_base, correct_random, total],
+            dtype=torch.long, device=self.device,
+        )
+        counters = self.accelerator.reduce(counters, reduction="sum")
+        correct_steered, correct_base, correct_random, total = [int(x) for x in counters.tolist()]
+
+        # Text metrics computed on each process's local shard; logged on main process only.
         steered_metrics = calculate_text_report(all_preds_steered, all_refs)
         base_metrics = calculate_text_report(all_preds_base, all_refs)
 
